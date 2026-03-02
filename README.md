@@ -1,8 +1,8 @@
 # Chuck
 
-**Adam with self-awareness.**
+**Optimizer with self-awareness.**
 
-Chuck Norris doesn't do pushups. He pushes the Earth down.
+Chuck Norris doesn't do pushups. He pushes the Earth down. 
 Chuck Optimizer doesn't follow gradients. Gradients follow Chuck.
 
 ```
