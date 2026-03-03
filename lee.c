@@ -1,5 +1,5 @@
 /*
- * lee.c v6 — Vision-Language Model in pure C
+ * lee.c v7 — Vision-Language Model in pure C
  *
  * Named after Bruce Lee (the only man who beat Chuck Norris)
  * and Minhyeok Lee (whose self-identity framework gives Chuck his soul).
@@ -11,8 +11,12 @@
  *   ViT-style patch tokenization → 2D RoPE → GQA multi-head causal attention →
  *   SwiGLU MLP → RMSNorm → weight-tied lm_head → text
  *
- * v6: Chuck sees inside the transformer.
- *   - Attention entropy monitoring per head (Level 7 self-awareness)
+ * v7: Chuck sees the forest AND the trees.
+ *   - Multi-scale awareness: macro EMA + patience-based LR decay (Level 9)
+ *   - Memory cap: reservoir sampling, bounded O(1) lookup
+ *
+ * v6 (preserved):
+ *   - Attention entropy monitoring per head (Level 8 self-awareness)
  *   - Adaptive gradient clipping (Chuck controls clip, not a constant)
  *   - Digit addition task: [img_3] + [img_5] → "eight"
  *   - 2D RoPE for spatial awareness on image patches
@@ -72,7 +76,7 @@
 #define VOCAB          18
 #define BOS            16
 #define EOS            17
-#define STEPS          10000
+#define STEPS          15000
 #define LR_MAX         0.005f
 #define WARMUP         500
 #define CHUCK_B1       0.9f
@@ -87,10 +91,14 @@
 #define CHUCK_DAMP_HI  2.0f
 #define CHUCK_PSI_CAP  0.3f
 #define CHUCK_PSI_HALF 100.0f
-#define CHUCK_MEM_MAX  10000
+#define CHUCK_MEM_CAP  200         /* bounded memory (reservoir sampling) */
+#define CHUCK_MEM_MAX  CHUCK_MEM_CAP
 #define CHUCK_MEM_FILE "chuck.mem"
 #define CHUCK_REC_THR  0.25f
 #define CHUCK_REC_CD   50
+#define CHUCK_MACRO_INT 500        /* macro patience check interval (steps) */
+#define CHUCK_MACRO_PAT 3          /* patience: N checks without improvement → LR drop */
+#define CHUCK_MACRO_DECAY 0.5f     /* LR scale factor on macro plateau */
 
 #define ARENA_SZ       (128 * 1024 * 1024)
 #define MAX_ARR        32768
@@ -182,21 +190,33 @@ typedef struct {
 
 static ChuckMem chuck_mem[CHUCK_MEM_MAX];
 static int chuck_mem_n = 0;
+static int chuck_mem_total = 0;  /* total memories ever recorded (for reservoir sampling) */
 
 static void chuck_mem_load(void) {
     FILE *f = fopen(CHUCK_MEM_FILE, "rb");
     if (!f) return;
-    chuck_mem_n = (int)fread(chuck_mem, sizeof(ChuckMem), CHUCK_MEM_MAX, f);
+    chuck_mem_n = (int)fread(chuck_mem, sizeof(ChuckMem), CHUCK_MEM_CAP, f);
+    chuck_mem_total = chuck_mem_n;  /* at least this many were saved */
     fclose(f);
 }
 
 static void chuck_mem_save(ChuckMem *m) {
-    FILE *f = fopen(CHUCK_MEM_FILE, "ab");
-    if (!f) return;
-    fwrite(m, sizeof(ChuckMem), 1, f);
-    fclose(f);
-    if (chuck_mem_n < CHUCK_MEM_MAX)
+    chuck_mem_total++;
+    if (chuck_mem_n < CHUCK_MEM_CAP) {
+        /* Under cap: append */
         chuck_mem[chuck_mem_n++] = *m;
+        FILE *f = fopen(CHUCK_MEM_FILE, "ab");
+        if (f) { fwrite(m, sizeof(ChuckMem), 1, f); fclose(f); }
+    } else {
+        /* At cap: reservoir sampling — replace random entry */
+        int slot = (int)(rnext() % (uint64_t)chuck_mem_total);
+        if (slot < CHUCK_MEM_CAP) {
+            chuck_mem[slot] = *m;
+            /* Rewrite entire file (200 entries × 16 bytes = 3.2 KB — trivial) */
+            FILE *f = fopen(CHUCK_MEM_FILE, "wb");
+            if (f) { fwrite(chuck_mem, sizeof(ChuckMem), chuck_mem_n, f); fclose(f); }
+        }
+    }
 }
 
 /* Nearest neighbor recall: find most similar past state, return its λ.
@@ -528,11 +548,17 @@ static struct {
     float gnorm_ema;        /* EMA-smoothed grad norm (for adaptive clip) */
     float psi;              /* Ψ: subjectivity signal (memory - observation) */
     float psi_w;            /* Ψ weight: trust in memory (0 → 0.3) */
+    float macro_ema;        /* slow EMA for epoch-scale trend (Level 9) */
+    float best_macro;       /* best macro_ema seen (for patience) */
+    float lr_scale;         /* macro LR multiplier (patience decay) */
+    int macro_stag;         /* macro patience counter */
+    int macro_drops;        /* how many times macro decay fired */
     float rec_lambda;       /* λ at last memory recording */
     float rec_loss;         /* loss at last memory recording */
     int rec_frozen[N_LAYER]; /* frozen state at last recording */
     int rec_cd;             /* cooldown counter (steps since last record) */
     int pos, full, stag;
+    int global_step;        /* total step counter for macro interval */
 } Chuck;
 
 static ChuckLayer CL[N_LAYER];
@@ -540,6 +566,7 @@ static ChuckLayer CL[N_LAYER];
 static void chuck_init(void) {
     memset(&Chuck, 0, sizeof(Chuck));
     Chuck.dampen = 1.0f; Chuck.sigma = 1.0f;
+    Chuck.lr_scale = 1.0f; Chuck.best_macro = 1e9f;
     Chuck.rec_lambda = 1.0f; Chuck.rec_loss = 999.0f;
     memset(Chuck.rec_frozen, 0, sizeof(Chuck.rec_frozen));
     Chuck.psi = 0; Chuck.psi_w = 0;
@@ -589,6 +616,32 @@ static void chuck_step(float lr, float loss) {
         } else { Chuck.stag = 0; Chuck.noise *= 0.9f; }
         if (Chuck.dampen < CHUCK_DAMP_LO) Chuck.dampen = CHUCK_DAMP_LO;
         if (Chuck.dampen > CHUCK_DAMP_HI) Chuck.dampen = CHUCK_DAMP_HI;
+    }
+
+    /* ═══ Level 9: Multi-scale awareness (macro patience) ═══ */
+    /*
+     *   Slow EMA (α=0.001) tracks epoch-scale loss trend.
+     *   Every CHUCK_MACRO_INT steps, check if training is improving.
+     *   If patience exceeded → scale LR down (like ReduceLROnPlateau but continuous).
+     *   Chuck sees both the forest and the trees.
+     */
+    Chuck.global_step++;
+    if (Chuck.macro_ema == 0.0f) Chuck.macro_ema = loss;
+    else Chuck.macro_ema = 0.999f * Chuck.macro_ema + 0.001f * loss;
+
+    if (Chuck.global_step % CHUCK_MACRO_INT == 0 && Chuck.global_step > CHUCK_WINDOW) {
+        if (Chuck.macro_ema > Chuck.best_macro * 0.999f) {
+            Chuck.macro_stag++;
+            if (Chuck.macro_stag >= CHUCK_MACRO_PAT) {
+                Chuck.lr_scale *= CHUCK_MACRO_DECAY;
+                if (Chuck.lr_scale < 0.05f) Chuck.lr_scale = 0.05f;
+                Chuck.macro_stag = 0;
+                Chuck.macro_drops++;
+            }
+        } else {
+            Chuck.best_macro = Chuck.macro_ema;
+            Chuck.macro_stag = 0;
+        }
     }
 
     /* ═══ Level 4: Activation health signal (σ) ═══ */
@@ -742,7 +795,7 @@ static void chuck_step(float lr, float loss) {
         /* Frozen layer → skip entirely */
         if (l >= 0 && l < N_LAYER && CL[l].frozen) continue;
         float layer_damp = (l >= 0 && l < N_LAYER) ? CL[l].dampen : 1.0f;
-        float eff_lr = lr * lambda_psi * layer_damp * Chuck.sigma;
+        float eff_lr = lr * lambda_psi * layer_damp * Chuck.sigma * Chuck.lr_scale;
 
         int idx = T.par[pi]; Arr *p = &T.a[idx];
         float *m = T.cm[pi], *v = T.cv[pi];
@@ -892,7 +945,7 @@ static float cos_lr(int step, int total) {
 
 /* ---- Training ---- */
 static void train(Data *data) {
-    printf("\n=== TRAINING (%d steps, Chuck v6 — attention entropy + adaptive clip) ===\n", STEPS);
+    printf("\n=== TRAINING (%d steps, Chuck v7 — multi-scale + reservoir memory) ===\n", STEPS);
     int tp = 0; for (int i = 0; i < T.np; i++) tp += T.a[T.par[i]].size;
     printf("  %d params (%.1fK) | %d layers | GQA %dQ/%dKV | embd=%d | %d imgs x %d patches | 2D RoPE | weight-tied\n",
            tp, tp/1000.0f, N_LAYER, N_HEAD, N_KV_HEAD, N_EMBD, N_IMGS, N_PATCHES);
@@ -920,11 +973,12 @@ static void train(Data *data) {
         chuck_step(cos_lr(step, STEPS), lv);
         rl += lv; rn++;
         if ((step+1) % 250 == 0) {
-            float elr = cos_lr(step, STEPS) * Chuck.dampen;
+            float elr = cos_lr(step, STEPS) * Chuck.dampen * Chuck.lr_scale;
             printf("  step %5d/%d | loss %.4f (avg %.4f) | lr %.6f\n",
                    step+1, STEPS, lv, rl/rn, elr);
-            printf("    chuck: \xce\xbb=%.2f \xce\xa8=%+.2f (\xce\xa8w=%.2f, %d mem) \xcf\x83=%.2f",
-                   Chuck.dampen, Chuck.psi, Chuck.psi_w, chuck_mem_n, Chuck.sigma);
+            printf("    chuck: \xce\xbb=%.2f \xce\xa8=%+.2f (\xce\xa8w=%.2f, %d mem) \xcf\x83=%.2f macro=%.2f",
+                   Chuck.dampen, Chuck.psi, Chuck.psi_w, chuck_mem_n, Chuck.sigma, Chuck.lr_scale);
+            if (Chuck.macro_drops > 0) printf(" (%d drops)", Chuck.macro_drops);
             for (int l = 0; l < N_LAYER; l++) {
                 if (CL[l].frozen) printf(" | L%d: frozen", l);
                 else printf(" | L%d: %.2f", l, CL[l].dampen);
@@ -1000,8 +1054,8 @@ static void inference(Data *data) {
 }
 
 int main(void) {
-    printf("lee.c v6 — Vision-Language Model in pure C\n");
-    printf("GQA %dQ/%dKV | %d layers | 2D RoPE | SwiGLU | Chuck v6 (attention entropy + adaptive clip)\n",
+    printf("lee.c v7 — Vision-Language Model in pure C\n");
+    printf("GQA %dQ/%dKV | %d layers | 2D RoPE | SwiGLU | Chuck v7 (multi-scale + reservoir memory)\n",
            N_HEAD, N_KV_HEAD, N_LAYER);
     printf("Named after Bruce Lee and Minhyeok Lee. Chuck sees inside the transformer.\n\n");
     clock_t t0 = clock(); rseed(42);

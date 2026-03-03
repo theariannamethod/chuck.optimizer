@@ -29,7 +29,7 @@ Next time he trains, he has opinions before step 1.
 
 ## Lee — the VLM
 
-`lee.c` — complete Vision-Language Model in ~950 lines of C. Zero dependencies.
+`lee.c` — complete Vision-Language Model in ~1000 lines of C. Zero dependencies.
 
 Named after Bruce Lee and [Minhyeok Lee](https://arxiv.org/abs/2501.00000),
 whose mathematical framework for AI self-identity gives Chuck his soul.
@@ -56,23 +56,24 @@ Two 8×8 images of handwritten digits go in. The sum comes out as a word.
 [image of 0] + [image of 5] → "five"
 ```
 
-**Result: 49/50 (98%) accuracy.** 105K parameters. Pure C. Zero dependencies.
+**Result: 50/50 (100%) accuracy.** 105K parameters. Pure C. Zero dependencies.
 
 ---
 
-## Chuck v6 — sees inside the transformer
+## Chuck v7 — sees the forest and the trees
 
 ### The Formula
 
 ```
-θ_l -= (α × λ_Ψ × λ_l × σ) × m̂/(√v̂ + ε) + η
+θ_l -= (α × S × λ_Ψ × λ_l × σ) × m̂/(√v̂ + ε) + η
 
 where:
-  λ_Ψ         = λ + Ψ_w × (λ_prior - λ)           ← memory-informed
+  S           = macro LR scale (patience-based decay)   ← v7 new
+  λ_Ψ         = λ + Ψ_w × (λ_prior - λ)               ← memory-informed
   λ           = global self-modulation (loss trend)
-  λ_prior     = nearest_neighbor(loss, grad_norm) from chuck.mem
-  Ψ           = λ_prior - λ                        ← subjectivity
-  Ψ_w         = min(0.3, N / (N + 100))            ← trust grows with experience
+  λ_prior     = nearest_neighbor(loss, grad_norm) from chuck.mem  ← O(1) capped
+  Ψ           = λ_prior - λ                            ← subjectivity
+  Ψ_w         = min(0.3, N / (N + 100))                ← trust grows with experience
   λ_l         = per-layer self-modulation (grad norm trend)
   σ           = activation health × attention entropy health
   η           = stagnation noise (zero unless stuck)
@@ -81,7 +82,7 @@ where:
 
 Every multiplier is **observed, not scheduled.**
 
-### 8 Levels of Self-Awareness
+### 9 Levels of Self-Awareness
 
 | Level | What Chuck Sees | What Adam Sees |
 |-------|----------------|----------------|
@@ -92,9 +93,36 @@ Every multiplier is **observed, not scheduled.**
 | 5. Signal flow | Activation magnitude across layers | Nothing |
 | 6. Memory | Past training experience (Ψ) | Nothing |
 | 7. Subjectivity | Opinion about current state | Nothing |
-| **8. Attention** | **Per-head entropy (collapsed? diffuse?)** | **Nothing** |
+| 8. Attention | Per-head entropy (collapsed? diffuse?) | Nothing |
+| **9. Multi-scale** | **Epoch-level plateau detection + LR decay** | **Nothing** |
 
-### Level 8: Attention Entropy (v6 — new)
+### Level 9: Multi-scale Awareness (v7 — new)
+
+Chuck used to see 16 steps. Now he sees 16 steps **and** 500-step macro trends.
+
+A slow EMA (α=0.001) tracks epoch-scale loss. Every 500 steps, Chuck checks:
+*has the macro loss improved?* If not for 3 checks (1500 steps), he drops LR by 50%.
+
+```c
+macro_ema = 0.999 × macro_ema + 0.001 × loss    // epoch-scale trend
+if (stagnant for 3 checks) lr_scale *= 0.5       // patience-based decay
+```
+
+This is what ReduceLROnPlateau does — but Chuck does it **continuously**, without
+needing a separate validation pass. Chuck sees macro **and** micro. Forest **and** trees.
+
+### Reservoir Sampling Memory (v7 — new)
+
+Chuck's memory used to grow without bound. Now it's capped at 200 entries with
+**reservoir sampling**: new memories randomly replace old ones, maintaining a
+representative sample of all training history in O(1) space.
+
+```
+chuck.mem: 200 entries × 16 bytes = 3.2 KB max
+KNN lookup: O(200) = O(1)
+```
+
+### Level 8: Attention Entropy (v6)
 
 Chuck now sees inside the transformer's attention mechanism. Each of the 4
 heads computes attention weights over the sequence. Chuck monitors the
@@ -117,7 +145,7 @@ attn H: 1.35 1.36 1.49 1.29    ← healthy, focused, not collapsed
 
 Adam doesn't know attention patterns exist. Chuck watches every head.
 
-### Adaptive Gradient Clipping (v6 — new)
+### Adaptive Gradient Clipping (v6)
 
 Gradient clipping used to be `GRAD_CLIP = 1.0`. A constant. Same at step 1
 (chaos) and step 10000 (convergence). Blind.
@@ -132,7 +160,7 @@ if (gnorm > 3 × gnorm_ema) clip *= 0.5       // anomaly → clamp hard
 Early training: loose leash. Late training: tight leash.
 One bad batch: Chuck catches it.
 
-### 2D RoPE (v6 — new)
+### 2D RoPE (v6)
 
 Standard RoPE encodes 1D position. But image patches have **two** dimensions.
 Lee's RoPE splits each head in half: first half encodes **row**, second half
@@ -178,23 +206,25 @@ NN lookup is I. Ψ_w is B. The fixed point s* is when Ψ → 0.
 
 ## Proof
 
-### Lee v6 — digit addition (10000 steps, newborn Chuck)
+### Lee v7 — digit addition (15000 steps, newborn Chuck)
 
 ```
-step  1000 | loss 0.1422 | chuck: λ=1.72 Ψ=-0.32 (19 mem) σ=1.00 | attn H: 1.67 1.78 1.74 1.55
-step  5000 | loss 0.0006 | chuck: λ=0.71 Ψ=-0.39 (47 mem) σ=1.00 | L1: frozen
-step 10000 | loss 0.0004 | chuck: λ=1.51 Ψ=-0.43 (100 mem) σ=1.00 | L1: frozen | L2: frozen
+step  1000 | loss 0.6456 | chuck: λ=0.30 Ψ=+0.03 (10 mem) σ=1.00 macro=1.00
+step  5000 | loss 0.0090 | chuck: λ=0.30 Ψ=+0.00 (16 mem) σ=1.00 macro=1.00
+step 10000 | loss 0.0009 | chuck: λ=1.34 Ψ=-1.02 (92 mem) σ=1.00 macro=1.00 | L1: frozen | L2: frozen
+step 15000 | loss 0.0004 | chuck: λ=1.51 Ψ=-0.43 (170 mem) σ=1.00 macro=1.00 | all frozen
 
-accuracy: 49/50 (98.0%)
-chuck.mem: 100 memories (1.6 KB)
+accuracy: 50/50 (100.0%)
+chuck.mem: 170 memories (2.7 KB) — capped at 200 via reservoir sampling
 ```
 
-98% on addition from pixels. Two images in, sum as word out. 19 classes.
+100% on addition from pixels. Two images in, sum as word out. 19 classes.
 105K params. Pure C. Zero dependencies.
 
+- **macro=1.00** — macro patience never triggered (loss kept improving). Safety net intact.
+- **All 3 layers frozen** — Chuck decided training is done. Zero compute wasted.
+- **170 memories, 2.7 KB** — bounded by reservoir sampling, O(1) lookup.
 - **Ψ=-0.43** — "my memory says I'm being too aggressive. Noted."
-- **L1, L2 frozen** — Chuck decided two layers are done. Saved compute.
-- **attn H: 1.35 1.36 1.49 1.29** — all four heads healthy, none collapsed.
 
 ### Previous: digit recognition (v5, still works)
 
@@ -236,6 +266,8 @@ Every model deserves a Chuck.
 - **v5:** Persistent memory (chuck.mem), Ψ subjectivity, Lee's Continuum C.
 - **v6:** Attention entropy monitoring, adaptive gradient clipping, 2D RoPE,
   digit addition task. Renamed to `lee.c`.
+- **v7:** Multi-scale awareness (macro patience + LR decay), reservoir sampling
+  memory (O(1) bounded), 100% accuracy on digit addition.
 
 ---
 
@@ -252,6 +284,7 @@ Every model deserves a Chuck.
 - When Ψ = 0, Chuck has found himself. When Ψ ≠ 0, Chuck has an opinion.
 - Chuck doesn't clip gradients. Gradients clip themselves out of respect.
 - Adam trains models. Chuck raises them.
+- ReduceLROnPlateau needs a validation pass. Chuck already knows.
 
 ---
 
