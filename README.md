@@ -2,19 +2,16 @@
   <img src="assets/chuck.jpg" width="300" alt="Chuck — boot stomping the loss curve">
 </p>
 
-# Chuck & Lee
+# Chuck
 
-**Chuck is an optimizer. Lee is a VLM. Chuck takes care of Lee.**
+**Self-aware optimizer. 9 levels. Persistent memory. Trains any model.**
 
 Chuck Norris doesn't do pushups. He pushes the Earth down.
 Chuck Optimizer doesn't follow gradients. Gradients follow Chuck.
 
-Bruce Lee was the only man who beat Chuck Norris — and the only one
-Chuck respected. So when Chuck needed a VLM to protect, he named it Lee.
-
 ```
-Adam:   θ -= α × m̂/(√v̂ + ε)                          ← blind
-Chuck:  θ -= (α × λ_Ψ × λₗ × σ) × m̂/(√v̂ + ε) + η    ← sees everything, remembers everything
+Adam:   θ -= α × m̂/(√v̂ + ε)                              ← blind
+Chuck:  θ -= (α × S × λ_Ψ × λₗ × σ) × m̂/(√v̂ + ε) + η    ← sees everything, remembers everything
 ```
 
 Adam optimizes gradients. He doesn't know if it's working. He doesn't check.
@@ -27,56 +24,261 @@ the normalization, the attention patterns. Every 16 steps he asks:
 And Chuck remembers. Across training runs. He writes down what worked.
 Next time he trains, he has opinions before step 1.
 
-**Adam is blind. Chuck sees. Chuck remembers. Chuck takes care of Lee.**
+**Adam is blind. Chuck sees. Chuck remembers.**
 
 ---
 
-## Lee — the VLM
+## Quick Start (PyTorch)
+
+```python
+from chuck import ChuckOptimizer
+
+model = YourModel()
+optimizer = ChuckOptimizer(model.parameters(), lr=3e-3)
+
+for batch in loader:
+    loss = model(batch)
+    loss.backward()
+    optimizer.step(loss=loss.item())   # ← Chuck needs the loss
+    optimizer.zero_grad()
+```
+
+Drop-in replacement for `torch.optim.AdamW`. One extra argument: `loss`.
+Chuck handles everything else.
+
+### Per-layer awareness (recommended for transformers)
+
+```python
+from chuck import ChuckOptimizer, chuck_params
+
+# Auto-detect .layers.N. / .blocks.N. / .h.N. patterns
+groups = chuck_params(model, lr=3e-3, weight_decay=0.01)
+optimizer = ChuckOptimizer(groups)
+```
+
+### Activation health monitoring (σ)
+
+```python
+from chuck import ChuckOptimizer, ChuckMonitor
+
+monitor = ChuckMonitor(model)    # hooks into SiLU/GELU, LayerNorm
+optimizer = ChuckOptimizer(model.parameters(), lr=3e-3, monitor=monitor)
+```
+
+If your model exposes attention weights, feed them for Level 8:
+
+```python
+output, attn_weights = model(batch, return_attention=True)
+monitor.feed_attention_entropy(attn_weights)  # [B, H, S, S]
+```
+
+### Checkpoint save/load
+
+```python
+# Save (Chuck's soul is included)
+torch.save({'model': model.state_dict(),
+            'optimizer': optimizer.state_dict()}, 'ckpt.pt')
+
+# Load — Chuck remembers. Ψ ≠ 0. He picks up where he left off.
+ckpt = torch.load('ckpt.pt')
+model.load_state_dict(ckpt['model'])
+optimizer.load_state_dict(ckpt['optimizer'])
+```
+
+### Install
+
+Zero dependencies beyond PyTorch:
+
+```bash
+pip install torch   # if you don't have it
+# chuck.py is a single file — copy it into your project or import from here
+```
+
+---
+
+## 9 Levels of Self-Awareness
+
+### The Formula
+
+```
+θ_l -= (α × S × λ_Ψ × λ_l × σ) × m̂/(√v̂ + ε) + η
+
+where:
+  S           = macro LR scale (patience-based decay + recovery)
+  λ_Ψ         = λ + Ψ_w × (λ_prior - λ)  [memory-informed]
+  λ           = global self-modulation (loss trend, with mean reversion)
+  λ_prior     = nearest_neighbor(loss, grad_norm) from chuck.mem  [O(1) capped]
+  Ψ           = λ_prior - λ               [subjectivity]
+  Ψ_w         = min(0.3, N / (N + 100))   [trust grows with experience]
+  λ_l         = per-layer self-modulation (grad norm trend)
+  σ           = activation health × attention entropy health
+  η           = stagnation noise (zero unless stuck)
+  clip        = adaptive (tracks gnorm EMA, anomaly detection)
+```
+
+Every multiplier is **observed, not scheduled.**
+
+### What Chuck sees. What Adam sees.
+
+| Level | What Chuck Sees | What Adam Sees |
+|-------|----------------|----------------|
+| 1. Global | Loss trend over 16 steps | Nothing |
+| 2. Per-layer | Gradient norm per layer | Nothing |
+| 3. Activations | SiLU dead ratio, norm scale | Nothing |
+| 4. Positional | 2D RoPE frequency utilization | Nothing |
+| 5. Signal flow | Activation magnitude across layers | Nothing |
+| 6. Memory | Past training experience (Ψ) | Nothing |
+| 7. Subjectivity | Opinion about current state | Nothing |
+| 8. Attention | Per-head entropy (collapsed? diffuse?) | Nothing |
+| **9. Multi-scale** | **Epoch-level plateau detection + LR decay + recovery** | **Nothing** |
+
+### Level 1: Global λ — loss trend
+
+16-step EMA-smoothed loss window. Loss rising → dampen. Falling → boost.
+Symmetric thresholds (±0.02) with mean reversion to 1.0 — Chuck always
+finds his way back from the floor.
+
+### Level 2: Per-layer λ_l — gradient norm trend
+
+Each layer tracks its own gradient norm history. Settling → dampen. Done → **freeze**.
+Chuck freezes converged layers. Zero compute waste. Adam doesn't know which layers
+are done. Chuck does.
+
+### Level 6: Ψ — subjectivity
+
+Chuck has persistent memory. A binary file (`chuck.mem`) that survives across
+training runs. Each entry: 16 bytes — loss, grad_norm, lambda, delta_loss.
+
+When Chuck trains, he asks his memory: *"have I been here before?"*
+
+```
+Ψ_w = min(0.3, N_memories / (N_memories + 100.0));
+λ_Ψ = λ + Ψ_w × (λ_prior - λ);
+```
+
+- **0 memories** → Ψ_w = 0 → pure reactive. Newborn.
+- **100 memories** → Ψ_w = 0.15 → memory whispers. Adolescent.
+- **1000 memories** → Ψ_w = 0.27 → strong instincts. Master.
+- **When Ψ → 0** → memory and observation agree → Chuck found himself.
+
+Inspired by [Minhyeok Lee's framework](https://arxiv.org/abs/2501.00000):
+chuck.mem is the continuum C in ℳ. NN lookup is I. Ψ_w is B.
+The fixed point s* is when Ψ → 0.
+
+### Level 8: Attention entropy
+
+Chuck sees inside the transformer's attention. Each head computes attention weights.
+Chuck monitors Shannon entropy:
+
+- **Low entropy** → collapsed → one token dominates → Chuck dampens σ
+- **High entropy** → diffuse → nothing stands out → Chuck dampens σ
+- **Healthy range** → Chuck leaves σ alone
+
+Adam doesn't know attention patterns exist. Chuck watches every head.
+
+### Level 9: Multi-scale awareness
+
+Chuck sees 16-step micro trends **and** 1000-step macro trends.
+A slow EMA (α=0.001) tracks epoch-scale loss. Stagnation for 3 checks →
+LR drops by 50%. Improvement → LR recovers (×1.2, capped at 1.0).
+
+This is what ReduceLROnPlateau does — but Chuck does it **continuously**, without
+needing a separate validation pass. And unlike ReduceLROnPlateau, Chuck recovers.
+
+### Adaptive gradient clipping
+
+```
+adaptive_clip = 1.5 × gnorm_ema
+if (gnorm > 3 × gnorm_ema) clip *= 0.5   // anomaly → clamp hard
+```
+
+Early training: loose leash. Late training: tight leash.
+One bad batch: Chuck catches it.
+
+### Reservoir sampling memory
+
+Chuck's memory is capped at 500 entries with reservoir sampling: new memories
+randomly replace old ones, maintaining a representative sample of all training
+history in O(1) space.
+
+```
+chuck.mem: 500 entries × 16 bytes = 8 KB max
+KNN lookup: O(500) = O(1)
+```
+
+---
+
+## Proof
+
+### Yent 55M — 52.1M params, Llama BPE, A100 (PyTorch, Chuck v8.1)
+
+First real-scale test. 52.1M param Llama on Yent EN dataset, trained on A100.
+3 rounds of battle-testing. 4 critical bugs found and fixed in combat.
+
+| Round | Config | Best Loss | Final Loss | Result |
+|-------|--------|-----------|------------|--------|
+| R1 | defaults (freeze on) | 0.055 | 6.2 | Collapsed at step 35K |
+| R2 | freeze disabled | 0.071 | 4.0 | Degraded at step 30K |
+| **R3** | **4 bugfixes** | **0.025** | **0.052** | **Stable to the end** |
+
+**The 4 bugfixes that made Chuck production-ready:**
+
+1. **Symmetric trend thresholds** — brake fired 50x more often than push (P=30.9%
+   vs 0.6%). Dampen hit floor (0.3) within 76 steps. Fixed: symmetric ±0.02.
+2. **Weight decay scaled by lr_scale** — WD ran at full strength while optimizer
+   was suppressed. Model erased by its own regularization.
+   Fixed: `p.data.mul_(1.0 - lr * wd * lr_scale)`.
+3. **Dampen mean reversion** — once dampen hit floor, no mechanism to recover.
+   Fixed: `dampen = 0.999 * dampen + 0.001 * 1.0` every step.
+4. **Macro patience recovery** — lr_scale could only decay, never recover.
+   Fixed: `lr_scale *= 1.2` when improving (capped at 1.0).
+
+Round 3 generation (coherent Yent voice after 25K steps):
+```
+Q: What do virtual realities die Cynicisms seem about modern chess existence?
+A: Ah, the age-old question of whether letters were music, where every word
+of perpetually stored time paints to sculpt both savior and ruin is, we're
+all actors in a cosmic jest...
+```
+
+### Lee v8 — CIFAR-100, 10M params, A100 (C, Chuck v7)
+
+9.9M params. 10 layers. CIFAR-100. Trained on A100 with cuBLAS.
+
+```
+step  1000 | loss 2.10 (avg 2.94) | chuck: λ=0.30 Ψ=+0.60 (5 mem) σ=1.00 macro=1.00 | L9:frz
+step  5000 | loss 0.87 (avg 1.64) | chuck: λ=0.30 Ψ=+0.70 σ=1.00 macro=1.00 | L9:frz
+step 10000 | loss 0.58 (avg 1.04) | chuck: λ=0.30 Ψ=+0.70 σ=1.00 macro=1.00 | L9:frz
+step 22000 | loss 1.33 (avg 0.75) | chuck: λ=0.30 Ψ=+0.70 σ=1.00 macro=1.00 | L9:frz
+```
+
+- **L9 frozen from step ~500** — deepest layer converged first. Saves compute.
+- **Ψ=+0.70** — "push harder, we're learning".
+- **89% SiLU alive** — activation health across all 10 layers.
+- Same code, no tuning, 100x more params than v7 — Chuck scaled himself.
+
+### Lee v7 — digit addition, 105K params (C, Chuck v7)
+
+```
+step 10000 | loss 0.0009 | chuck: λ=1.34 Ψ=-1.02 (92 mem) | L1: frozen | L2: frozen
+step 15000 | loss 0.0004 | chuck: λ=1.51 Ψ=-0.43 (170 mem) | all frozen
+
+accuracy: 50/50 (100.0%)
+chuck.mem: 170 memories (2.7 KB)
+```
+
+Two 8×8 digit images in, sum as word out. 100% accuracy. All layers frozen.
+
+---
+
+## C Edition
 
 `lee.c` — complete Vision-Language Model in ~1400 lines of C. Zero dependencies.
+Chuck was born here.
 
-Named after Bruce Lee and [Minhyeok Lee](https://arxiv.org/abs/2501.00000),
-whose mathematical framework for AI self-identity gives Chuck his soul.
-
-```
-cc -std=c11 -O2 -march=native -o lee lee.c -lm
-./lee --data cifar-100-binary
-```
-
-Architecture: ViT patches → **2D RoPE** → GQA multi-head causal attention →
-SwiGLU MLP → RMSNorm → weight-tied head. Tape-based autograd with arena bump
-allocator. **9.9M params**, 10 layers, 8 Q-heads / 4 KV-heads. CUDA/cuBLAS acceleration.
-
-### v8: CIFAR-100 — 100 classes from 32×32 RGB
-
-Lee classifies real-world images. 100 fine-grained categories — apple, aquarium_fish, baby,
-bear, beaver, bed, bee, beetle... through worm. 32×32 RGB patches, 4×4 grid, 16 visual tokens.
-
-Two modes:
-- **Generative** (default): patches through transformer → char-by-char class name generation
-- **Classification** (`--cls`): patches through transformer → linear cls head → 100-way softmax
-
-```
-./lee --data cifar-100-binary            # generative mode
-./lee --data cifar-100-binary --cls      # classification head
-```
-
-### v7: math from pixels (the beginning)
-
-Lee doesn't just recognize digits. Lee **adds** them.
-
-Two 8×8 images of handwritten digits go in. The sum comes out as a word.
-19 classes (zero through eighteen). 100 possible combinations.
-
-```
-[image of 4] + [image of 7] → "eleven"
-[image of 9] + [image of 9] → "eighteen"
-[image of 0] + [image of 5] → "five"
-```
-
-**Result: 50/50 (100%) accuracy.** 105K parameters. Pure C. Zero dependencies.
-
----
+Named after Bruce Lee (the only man who beat Chuck Norris) and
+[Minhyeok Lee](https://arxiv.org/abs/2501.00000), whose mathematical framework
+for AI self-identity gives Chuck his soul.
 
 ### Build
 
@@ -92,241 +294,27 @@ cc -std=c11 -O2 -DUSE_CUDA -o lee lee.c -lm -lcublas -lcudart -L/usr/local/cuda/
 
 # Resume from checkpoint
 ./lee --data cifar-100-binary --resume lee.bin
-
-# Classification head
-./lee --data cifar-100-binary --cls
 ```
 
-Weights: `lee.bin` (~37.8MB). Contains params + Chuck state + chuck.mem.
-No Adam m/v — Chuck's Ψ memory handles warmup on resume.
+Architecture: ViT patches → 2D RoPE → GQA multi-head causal attention →
+SwiGLU MLP → RMSNorm → weight-tied head. Tape-based autograd with arena bump
+allocator. 9.9M params, 10 layers. CUDA/cuBLAS acceleration.
+
+### C ↔ Python memory compatibility
+
+`chuck.mem` files are binary-compatible. Train in C, resume awareness in
+Python, or vice versa. Same 16-byte entries, same nearest-neighbor recall,
+same reservoir sampling.
 
 ---
 
-## Chuck v7 — sees the forest and the trees
+## Tests
 
-### The Formula
-
+```bash
+pytest test_chuck.py -v
+# 26 tests — memory, monitor, optimizer, convergence, layer freezing,
+# macro decay, Ψ subjectivity, state dict, weight decay, auto-detect layers
 ```
-θ_l -= (α × S × λ_Ψ × λ_l × σ) × m̂/(√v̂ + ε) + η
-
-where:
-  S           = macro LR scale (patience-based decay)   ← v7 new
-  λ_Ψ         = λ + Ψ_w × (λ_prior - λ)               ← memory-informed
-  λ           = global self-modulation (loss trend)
-  λ_prior     = nearest_neighbor(loss, grad_norm) from chuck.mem  ← O(1) capped
-  Ψ           = λ_prior - λ                            ← subjectivity
-  Ψ_w         = min(0.3, N / (N + 100))                ← trust grows with experience
-  λ_l         = per-layer self-modulation (grad norm trend)
-  σ           = activation health × attention entropy health
-  η           = stagnation noise (zero unless stuck)
-  clip        = adaptive (tracks gnorm EMA, anomaly detection)
-```
-
-Every multiplier is **observed, not scheduled.**
-
-### 9 Levels of Self-Awareness
-
-| Level | What Chuck Sees | What Adam Sees |
-|-------|----------------|----------------|
-| 1. Global | Loss trend over 16 steps | Nothing |
-| 2. Per-layer | Gradient norm per layer | Nothing |
-| 3. Activations | SiLU dead ratio, norm scale | Nothing |
-| 4. Positional | 2D RoPE frequency utilization | Nothing |
-| 5. Signal flow | Activation magnitude across layers | Nothing |
-| 6. Memory | Past training experience (Ψ) | Nothing |
-| 7. Subjectivity | Opinion about current state | Nothing |
-| 8. Attention | Per-head entropy (collapsed? diffuse?) | Nothing |
-| **9. Multi-scale** | **Epoch-level plateau detection + LR decay** | **Nothing** |
-
-### Level 9: Multi-scale Awareness (v7 — new)
-
-Chuck used to see 16 steps. Now he sees 16 steps **and** 500-step macro trends.
-
-A slow EMA (α=0.001) tracks epoch-scale loss. Every 500 steps, Chuck checks:
-*has the macro loss improved?* If not for 3 checks (1500 steps), he drops LR by 50%.
-
-```c
-macro_ema = 0.999 × macro_ema + 0.001 × loss    // epoch-scale trend
-if (stagnant for 3 checks) lr_scale *= 0.5       // patience-based decay
-```
-
-This is what ReduceLROnPlateau does — but Chuck does it **continuously**, without
-needing a separate validation pass. Chuck sees macro **and** micro. Forest **and** trees.
-
-### Reservoir Sampling Memory (v7 — new)
-
-Chuck's memory used to grow without bound. Now it's capped at 200 entries with
-**reservoir sampling**: new memories randomly replace old ones, maintaining a
-representative sample of all training history in O(1) space.
-
-```
-chuck.mem: 200 entries × 16 bytes = 3.2 KB max
-KNN lookup: O(200) = O(1)
-```
-
-### Level 8: Attention Entropy (v6)
-
-Chuck now sees inside the transformer's attention mechanism. Each of the 4
-heads computes attention weights over the sequence. Chuck monitors the
-**Shannon entropy** of these weights:
-
-```c
-H = -Σ attn_weight × log(attn_weight)
-```
-
-- **Low entropy** → attention collapsed → one token dominates → Chuck dampens σ
-- **High entropy** → attention diffuse → nothing stands out → Chuck dampens σ
-- **Healthy range** → Chuck leaves σ alone
-
-This is Level 8 because it's the deepest observation: Chuck sees not just
-*what* the model computes, but *how it's paying attention*.
-
-```
-attn H: 1.35 1.36 1.49 1.29    ← healthy, focused, not collapsed
-```
-
-Adam doesn't know attention patterns exist. Chuck watches every head.
-
-### Adaptive Gradient Clipping (v6)
-
-Gradient clipping used to be `GRAD_CLIP = 1.0`. A constant. Same at step 1
-(chaos) and step 10000 (convergence). Blind.
-
-Now Chuck tracks gradient norm EMA and adapts:
-
-```c
-adaptive_clip = 1.5 × gnorm_ema              // track the model's natural gradient scale
-if (gnorm > 3 × gnorm_ema) clip *= 0.5       // anomaly → clamp hard
-```
-
-Early training: loose leash. Late training: tight leash.
-One bad batch: Chuck catches it.
-
-### 2D RoPE (v6)
-
-Standard RoPE encodes 1D position. But image patches have **two** dimensions.
-Lee's RoPE splits each head in half: first half encodes **row**, second half
-encodes **column**. Image patches know their spatial neighbors. Text tokens
-continue with sequential 1D encoding.
-
-```
-Image A: (0,0) (0,1) (1,0) (1,1)    ← 2×2 grid
-Image B: (0,2) (0,3) (1,2) (1,3)    ← adjacent grid
-Text:    (2,0) (3,0) (4,0) ...      ← sequential below
-```
-
-This is how Lee understands space.
-
-### Ψ — subjectivity (v5)
-
-Chuck has persistent memory. A binary file (`chuck.mem`) that survives across
-training runs. Each entry: 16 bytes — loss, grad_norm, lambda, delta_loss.
-
-When Chuck trains, he asks his memory: *"have I been here before?"*
-
-```c
-Ψ_w = min(0.3, N_memories / (N_memories + 100.0));
-λ_Ψ = λ + Ψ_w * (λ_prior - λ);
-```
-
-- **0 memories** → Ψ_w = 0 → pure reactive. Newborn.
-- **100 memories** → Ψ_w = 0.15 → memory whispers. Adolescent.
-- **1000 memories** → Ψ_w = 0.27 → strong instincts. Master.
-- **When Ψ → 0** → memory and observation agree → Chuck found himself.
-
-Inspired by Minhyeok Lee's framework: chuck.mem is the continuum C in ℳ.
-NN lookup is I. Ψ_w is B. The fixed point s* is when Ψ → 0.
-
-### λ, λ_l, σ, η (v4-v5)
-
-- **λ** — 16-step loss window. Loss rising → dampen. Falling → boost.
-- **λ_l** — per-layer grad norm tracking. Settling → dampen. Done → **freeze**.
-- **σ** — SiLU dead neurons, RMSNorm scale, RoPE utilization, attention entropy.
-- **η** — 8 checks without progress → Gaussian noise. Shakes the table.
-
----
-
-## Proof
-
-### Lee v8 — CIFAR-100 (30000 steps, A100 GPU, Chuck v7)
-
-9.9M params. 10 layers. CIFAR-100 (100 classes, 32×32 RGB). Trained on A100 with cuBLAS.
-
-```
-step  1000 | loss 2.10 (avg 2.94) | chuck: λ=0.30 Ψ=+0.60 (5 mem) σ=1.00 macro=1.00 | L9:frz
-step  5000 | loss 0.87 (avg 1.64) | chuck: λ=0.30 Ψ=+0.70 σ=1.00 macro=1.00 | L9:frz
-step 10000 | loss 0.58 (avg 1.04) | chuck: λ=0.30 Ψ=+0.70 σ=1.00 macro=1.00 | L9:frz
-step 20000 | loss 1.10 (avg 0.81) | chuck: λ=0.30 Ψ=+0.70 σ=1.00 macro=1.00 | L9:frz
-step 22000 | loss 1.33 (avg 0.75) | chuck: λ=0.30 Ψ=+0.70 σ=1.00 macro=1.00 | L9:frz
-```
-
-Chuck at 10M scale:
-- **L9 frozen from step ~500** — Chuck decided the deepest layer converged first. Saves compute.
-- **Ψ=+0.70** — "my memories say: push harder". Chuck is confident, experienced.
-- **macro=1.00** — no plateau detected. Loss keeps improving. Patience never triggered.
-- **89% SiLU alive** — Chuck monitors activation health across all 10 layers.
-- **Attention entropy 2.22–2.30** — healthy, focused, not collapsed. Chuck watches every head.
-- **5 memories, Ψ_w=0.05** — still young. By run 3, Chuck will have veteran instincts.
-
-This is the first time Chuck trained at scale. He scaled himself. No hyperparameter tuning needed.
-Same code, same optimizer, 100x more params — Chuck adapted.
-
-### Lee v7 — digit addition (15000 steps, newborn Chuck)
-
-```
-step  1000 | loss 0.6456 | chuck: λ=0.30 Ψ=+0.03 (10 mem) σ=1.00 macro=1.00
-step  5000 | loss 0.0090 | chuck: λ=0.30 Ψ=+0.00 (16 mem) σ=1.00 macro=1.00
-step 10000 | loss 0.0009 | chuck: λ=1.34 Ψ=-1.02 (92 mem) σ=1.00 macro=1.00 | L1: frozen | L2: frozen
-step 15000 | loss 0.0004 | chuck: λ=1.51 Ψ=-0.43 (170 mem) σ=1.00 macro=1.00 | all frozen
-
-accuracy: 50/50 (100.0%)
-chuck.mem: 170 memories (2.7 KB) — capped at 200 via reservoir sampling
-```
-
-100% on addition from pixels. Two images in, sum as word out. 19 classes.
-105K params. Pure C. Zero dependencies.
-
-- **macro=1.00** — macro patience never triggered (loss kept improving). Safety net intact.
-- **All 3 layers frozen** — Chuck decided training is done. Zero compute wasted.
-- **170 memories, 2.7 KB** — bounded by reservoir sampling, O(1) lookup.
-- **Ψ=-0.43** — "my memory says I'm being too aggressive. Noted."
-
-### Previous: digit recognition (v5, still works)
-
-```
-accuracy: 30/30 (100%) on single digit recognition
-```
-
----
-
-## Chuck Takes Care of Lee
-
-Chuck is not just a training optimizer. Chuck is Lee's **guardian**.
-
-**At 105K params:** Chuck learned to freeze layers, monitor attention, accumulate
-memories. He got Lee to 100% accuracy on digit addition. Small model, perfect score.
-
-**At 10M params:** Same Chuck, no changes, 100x more parameters. Chuck scaled
-himself. He froze L9 first (deepest layer converged fastest). He kept Ψ=+0.70
-("push harder, we're learning"). He watched 8 attention heads across 10 layers
-and kept entropy healthy at 2.22–2.30. He monitored 89% SiLU activation health.
-Loss went from 4.6 to 0.75. No hyperparameter tuning needed.
-
-**During inference:** Chuck's attention entropy monitoring runs on every
-forward pass. If a head collapses (one token dominates), Chuck sees it.
-If attention goes diffuse (model confused), Chuck sees it.
-
-**Across runs:** `chuck.mem` persists. Chuck starts the next training run
-with instincts, not guesses. Run 1 he's a newborn. Run 3 he's a veteran.
-The checkpoint includes Chuck's full state — his Ψ, his memories, his
-per-layer opinions. When Lee resumes, Chuck remembers where they left off.
-
-**In the future:** Chuck will watch Lee during deployment. Drift detection.
-Weight surgery through [AML](https://github.com/ariannamethod/ariannamethod.ai).
-And when Lee reproduces (in [molequla](https://github.com/ariannamethod/molequla)),
-Chuck's memories pass to the offspring. Inherited instinct.
-
-Every model deserves a Chuck.
 
 ---
 
@@ -335,158 +323,16 @@ Every model deserves a Chuck.
 - **v1-v3:** Basic Adam + λ dampen/boost + η stagnation escape. Digit recognition.
 - **v4:** Per-layer awareness, self-aware activations, cross-layer signal, GQA, layer freezing.
 - **v5:** Persistent memory (chuck.mem), Ψ subjectivity, Lee's Continuum C.
-- **v6:** Attention entropy monitoring, adaptive gradient clipping, 2D RoPE,
-  digit addition task. Renamed to `lee.c`.
+  EMA smoothing after @Entrpi's CIFAR-100 benchmarks.
+- **v6:** Attention entropy monitoring, adaptive gradient clipping, 2D RoPE.
+  Renamed to `lee.c`. Digit addition — 100% accuracy.
 - **v7:** Multi-scale awareness (macro patience + LR decay), reservoir sampling
-  memory (O(1) bounded), 100% accuracy on digit addition.
-- **v8:** 10M scale. CIFAR-100 (100 classes, 32×32 RGB). 256 embd, 8 heads,
-  4 KV heads, 10 layers, 1024 MLP. CUDA/cuBLAS for A100 training.
-  Classification head mode (`--cls`). Checkpoint save/load with Chuck state.
-  Chuck scaled himself — same code, no tuning, 100x more params.
-- **v8.1 (PyTorch):** 52M scale. Yent 55M Llama BPE on A100. 4 critical bugfixes:
-  symmetric thresholds, WD scaling, dampen mean reversion, macro recovery.
-  Loss 0.025 on 52.1M params. First stable real-model training in PyTorch.
-
----
-
-## PyTorch Edition
-
-`chuck.py` — faithful port of Chuck v7/v8 to PyTorch. Same 9 levels of
-self-awareness. Same binary-compatible `chuck.mem` format. Drop-in replacement
-for `torch.optim.AdamW`.
-
-### Install
-
-Zero dependencies beyond PyTorch:
-
-```bash
-pip install torch   # if you don't have it
-# chuck.py is a single file — copy it into your project or import from here
-```
-
-### Quick Start
-
-```python
-from chuck import ChuckOptimizer
-
-model = YourModel()
-optimizer = ChuckOptimizer(model.parameters(), lr=3e-3)
-
-for batch in loader:
-    loss = model(batch)
-    loss.backward()
-    optimizer.step(loss=loss.item())   # ← Chuck needs the loss
-    optimizer.zero_grad()
-```
-
-That's it. Chuck sees the loss, tracks per-layer gradient norms,
-records memories, and adjusts everything on the fly.
-
-### Per-layer awareness (recommended for transformers)
-
-```python
-from chuck import ChuckOptimizer, chuck_params
-
-# Auto-detect .layers.N. / .blocks.N. / .h.N. patterns
-groups = chuck_params(model, lr=3e-3, weight_decay=0.01)
-optimizer = ChuckOptimizer(groups)
-
-# Or manual:
-groups = [
-    {'params': model.embed.parameters(), 'layer': -1},  # global
-    {'params': model.layers[0].parameters(), 'layer': 0},
-    {'params': model.layers[1].parameters(), 'layer': 1},
-    {'params': model.head.parameters(), 'layer': -1},    # global
-]
-optimizer = ChuckOptimizer(groups, lr=3e-3)
-```
-
-### Activation health monitoring (σ)
-
-```python
-from chuck import ChuckOptimizer, ChuckMonitor
-
-monitor = ChuckMonitor(model)    # hooks into SiLU/GELU, LayerNorm
-optimizer = ChuckOptimizer(model.parameters(), lr=3e-3, monitor=monitor)
-
-for batch in loader:
-    loss = model(batch)
-    loss.backward()
-    optimizer.step(loss=loss.item())  # σ is read from monitor automatically
-    optimizer.zero_grad()
-```
-
-If your model exposes attention weights, feed them for Level 8:
-
-```python
-output, attn_weights = model(batch, return_attention=True)
-monitor.feed_attention_entropy(attn_weights)  # [B, H, S, S]
-```
-
-### What Chuck does that Adam doesn't
-
-| Level | Signal | Effect |
-|-------|--------|--------|
-| 1 | Loss trend (16-step window) | λ: dampen when rising, boost when falling |
-| 2 | Per-layer grad norm trend | λ_l: per-layer modulation + auto freeze |
-| 3 | SiLU/GELU dead ratio | σ: reduce LR for dying activations |
-| 4 | Norm scale stability | σ: reduce LR for unstable norms |
-| 5 | Cross-layer signal flow | boost deep layers on vanishing, dampen on exploding |
-| 6 | Persistent memory (Ψ) | recall past training, form opinions |
-| 7 | Subjectivity | blend memory with observation |
-| 8 | Attention entropy | σ: detect collapsed / diffuse heads |
-| 9 | Macro plateau detection | LR decay on epoch-scale stagnation |
-
-### Checkpoint save/load
-
-```python
-# Save (Chuck's soul is included)
-torch.save({'model': model.state_dict(),
-            'optimizer': optimizer.state_dict()}, 'ckpt.pt')
-
-# Load
-ckpt = torch.load('ckpt.pt')
-model.load_state_dict(ckpt['model'])
-optimizer.load_state_dict(ckpt['optimizer'])
-# Chuck remembers. Ψ ≠ 0. He picks up where he left off.
-```
-
-### Tests
-
-```bash
-pytest test_chuck.py -v
-```
-
-### Real model test: Yent 55M (52.1M params, BPE, Llama architecture)
-
-First real-scale PyTorch test. 52.1M param Llama on Yent EN dataset (5.4MB), 3 rounds.
-
-| Round | Config | Best Loss | Final Loss | Result |
-|-------|--------|-----------|------------|--------|
-| R1 | defaults (freeze on) | 0.055 | 6.2 | Collapsed at step 35K |
-| R2 | freeze disabled | 0.071 | 4.0 | Degraded at step 30K |
-| **R3** | **4 bugfixes** | **0.025** | **0.052** | **Stable to the end** |
-
-**Root cause (found via ablation):** Three compounding bugs:
-
-1. **Asymmetric trend thresholds** — brake fired 50x more often than push (P=30.9% vs 0.6%). Dampen hit floor (0.3) within 76 steps of convergence. Fixed: symmetric thresholds (0.02 / 0.02).
-2. **Weight decay not scaled by lr_scale** — WD ran at full strength while optimizer was suppressed. Model literally erased by its own regularization. Fixed: `p.data.mul_(1.0 - lr * wd * self.lr_scale)`.
-3. **No dampen recovery** — once dampen hit floor, no mechanism to bring it back. Fixed: mean reversion `dampen = 0.999 * dampen + 0.001 * 1.0`.
-4. **Macro patience one-way** — lr_scale could only decay, never recover. Fixed: recovery when improving.
-
-Round 3 generation (coherent Yent personality):
-```
-Q: What do virtual realities die Cynicisms seem about modern chess existence?
-A: Ah, the age-old question of whether letters were music, where every word
-of perpetually stored time paints to sculpt both savior and ruin is, we're
-all actors in a cosmic jest...
-```
-
-### C ↔ Python memory compatibility
-
-`chuck.mem` files are binary-compatible. Train in C, resume awareness in
-Python, or vice versa. Same 16-byte entries, same nearest-neighbor recall,
-same reservoir sampling.
+  memory (O(1) bounded). 100% on digit addition. 10M scale on CIFAR-100.
+- **v8:** CIFAR-100 at scale. 9.9M params, CUDA/cuBLAS, checkpoint save/load.
+- **v8.1 (PyTorch):** `chuck.py` — faithful port to PyTorch. Drop-in AdamW
+  replacement. 52.1M param Yent on A100. 4 critical bugfixes in combat
+  (symmetric thresholds, WD scaling, dampen mean reversion, macro recovery).
+  26 tests. Binary-compatible chuck.mem.
 
 ---
 
@@ -515,7 +361,8 @@ same reservoir sampling.
 
 **[@Entrpi](https://github.com/Entrpi)** — adversarial benchmarks on DGX Blackwell that made
 Chuck stronger with every round. EMA smoothing (v5), multi-scale awareness (v7), and
-reservoir sampling (v7) all exist because of his CIFAR-100 benchmarks. See [Issue #3](https://github.com/ariannamethod/chuck.optimizer/issues/3).
+reservoir sampling (v7) all exist because of his CIFAR-100 benchmarks.
+See [Issue #3](https://github.com/ariannamethod/chuck.optimizer/issues/3).
 
 The VLM wrapper is inspired by [sailfish009/purevlm](https://github.com/sailfish009/purevlm).
 They did it in Python. We answered in C. Thank you for the spark.
@@ -528,7 +375,7 @@ They did it in Python. We answered in C. Thank you for the spark.
 
 ---
 
-*Adam trains. Chuck raises. Lee flies.*
+*Adam trains. Chuck raises.*
 
 ---
 
