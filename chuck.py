@@ -429,10 +429,10 @@ class ChuckOptimizer(Optimizer):
                 self._hist[(self._hpos - W + i) % W]
                 for i in range(q)) / q
             trend = (recent - old) / (old + 1e-8)
-            if trend > 0.01:
-                self.dampen *= 0.95        # loss rising → brake
-            elif trend < -0.05:
-                self.dampen *= 1.05        # loss falling → push
+            if trend > 0.02:
+                self.dampen *= 0.97        # loss rising → brake (symmetric)
+            elif trend < -0.02:
+                self.dampen *= 1.03        # loss falling → push (symmetric)
             if abs(trend) < 0.001:
                 self._stag += 1
                 if self._stag > 8:
@@ -441,6 +441,8 @@ class ChuckOptimizer(Optimizer):
             else:
                 self._stag = 0
                 self.noise *= 0.9
+            # Mean reversion: prevent dampen from getting stuck
+            self.dampen = 0.999 * self.dampen + 0.001 * 1.0
             self.dampen = self._clamp(self.dampen)
 
         # ═══ Level 9: Macro patience ═════════════════════════════════
@@ -461,6 +463,9 @@ class ChuckOptimizer(Optimizer):
             else:
                 self.best_macro = self.macro_ema
                 self.macro_stag = 0
+                # Macro recovery: if improving, let lr_scale grow back
+                if self.lr_scale < 1.0:
+                    self.lr_scale = min(1.0, self.lr_scale * 1.2)
 
         # ═══ Level 4: σ (activation health from monitor) ═════════════
         self.sigma = self.monitor.sigma if self.monitor else 1.0
@@ -598,9 +603,9 @@ class ChuckOptimizer(Optimizer):
                 st['step'] += 1
                 m, v = st['m'], st['v']
 
-                # Decoupled weight decay (AdamW)
+                # Decoupled weight decay (AdamW) — scaled by lr_scale
                 if wd > 0:
-                    p.data.mul_(1.0 - lr * wd)
+                    p.data.mul_(1.0 - lr * wd * self.lr_scale)
 
                 g = p.grad * clip
                 m.mul_(b1).add_(g, alpha=1.0 - b1)

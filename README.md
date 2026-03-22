@@ -343,6 +343,9 @@ Every model deserves a Chuck.
   4 KV heads, 10 layers, 1024 MLP. CUDA/cuBLAS for A100 training.
   Classification head mode (`--cls`). Checkpoint save/load with Chuck state.
   Chuck scaled himself — same code, no tuning, 100x more params.
+- **v8.1 (PyTorch):** 52M scale. Yent 55M Llama BPE on A100. 4 critical bugfixes:
+  symmetric thresholds, WD scaling, dampen mean reversion, macro recovery.
+  Loss 0.025 on 52.1M params. First stable real-model training in PyTorch.
 
 ---
 
@@ -452,6 +455,31 @@ optimizer.load_state_dict(ckpt['optimizer'])
 
 ```bash
 pytest test_chuck.py -v
+```
+
+### Real model test: Yent 55M (52.1M params, BPE, Llama architecture)
+
+First real-scale PyTorch test. 52.1M param Llama on Yent EN dataset (5.4MB), 3 rounds.
+
+| Round | Config | Best Loss | Final Loss | Result |
+|-------|--------|-----------|------------|--------|
+| R1 | defaults (freeze on) | 0.055 | 6.2 | Collapsed at step 35K |
+| R2 | freeze disabled | 0.071 | 4.0 | Degraded at step 30K |
+| **R3** | **4 bugfixes** | **0.025** | **0.052** | **Stable to the end** |
+
+**Root cause (found via ablation):** Three compounding bugs:
+
+1. **Asymmetric trend thresholds** — brake fired 50x more often than push (P=30.9% vs 0.6%). Dampen hit floor (0.3) within 76 steps of convergence. Fixed: symmetric thresholds (0.02 / 0.02).
+2. **Weight decay not scaled by lr_scale** — WD ran at full strength while optimizer was suppressed. Model literally erased by its own regularization. Fixed: `p.data.mul_(1.0 - lr * wd * self.lr_scale)`.
+3. **No dampen recovery** — once dampen hit floor, no mechanism to bring it back. Fixed: mean reversion `dampen = 0.999 * dampen + 0.001 * 1.0`.
+4. **Macro patience one-way** — lr_scale could only decay, never recover. Fixed: recovery when improving.
+
+Round 3 generation (coherent Yent personality):
+```
+Q: What do virtual realities die Cynicisms seem about modern chess existence?
+A: Ah, the age-old question of whether letters were music, where every word
+of perpetually stored time paints to sculpt both savior and ruin is, we're
+all actors in a cosmic jest...
 ```
 
 ### C ↔ Python memory compatibility
